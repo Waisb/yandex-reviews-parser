@@ -5,7 +5,7 @@ from dataclasses import asdict
 from typing import Optional
 
 from selenium.webdriver.common.by import By
-from selenium.common.exceptions import NoSuchElementException
+from selenium.common.exceptions import NoSuchElementException, TimeoutException, JavascriptException
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
@@ -21,7 +21,7 @@ class Parser:
         self.driver = driver
         self.wait = WebDriverWait(driver, wait_timeout)
 
-        # Кеш последнего fetchReviews (аналогично ReviewsFetcher в code_3)
+        # Кеш последнего fetchReviews
         # {
         #   "business_id": "4987...",
         #   "url": ".../fetchReviews?...",
@@ -29,7 +29,7 @@ class Parser:
         # }
         self._last_fetch: Optional[dict] = None
 
-        # Включаем Network в CDP (как в code_3)
+        # Включаем Network в CDP 
         try:
             self.driver.execute_cdp_cmd("Network.enable", {})
         except Exception:
@@ -82,17 +82,14 @@ class Parser:
                 if status != 200:
                     continue
 
-                # Пытаемся достать businessId прямо из URL
                 bid_match = re.search(r"businessId=(\d+)", url)
                 found_bid = bid_match.group(1) if bid_match else None
 
-                # если зовут конкретный бизнес, и это не он — пропускаем
                 if business_id and found_bid and found_bid != business_id:
                     continue
                 if business_id and not found_bid:
                     continue
 
-                # Обновляем кеш
                 self._last_fetch = {
                     "business_id": found_bid,
                     "url": url,
@@ -119,23 +116,33 @@ class Parser:
 
         return None
 
-    def __scroll_to_bottom(self) -> None:
+    def __scroll_to_bottom(self, limit: int = -1) -> None:
         """
-        Скроллим список отзывов до конца.
+        Скроллим список отзывов до конца или пока не соберём limit штук.
+        limit = -1  -> скроллим до конца (старое поведение).
         """
+        prev_count = 0
+
         while True:
             elements = self.driver.find_elements(By.CLASS_NAME, self.REVIEWS_CLASS)
+            count = len(elements)
+
+            if limit > 0 and count >= limit:
+                break
+
+            if count == prev_count:
+                break
+
+            prev_count = count
+
             if not elements:
                 break
 
             last_elem = elements[-1]
-            self.driver.execute_script("arguments[0].scrollIntoView();", last_elem)
-
+            self.driver.execute_script(
+                "arguments[0].scrollIntoView({block: 'end'});", last_elem
+            )
             time.sleep(1)
-
-            new_elements = self.driver.find_elements(By.CLASS_NAME, self.REVIEWS_CLASS)
-            if len(new_elements) == len(elements):
-                break
 
     def __get_data_item(self, elem):
         """
@@ -241,16 +248,124 @@ class Parser:
             stars=stars,
         )
         return asdict(item)
+    
+    def __set_reviews_sort(self, sort: str | None = None) -> None:
+        """
+        Устанавливает сортировку отзывов.
 
-    def __get_data_reviews(self) -> list:
-        reviews = []
+        sort:
+          - 'default'   — По умолчанию
+          - 'newest'    — По новизне
+          - 'negative'  — Сначала отрицательные
+          - 'positive'  — Сначала положительные
+        """
+        if not sort:
+            return
+
+        label_map = {
+            "default": "По умолчанию",
+            "newest": "По новизне",
+            "negative": "Сначала отрицательные",
+            "positive": "Сначала положительные",
+        }
+        label = label_map.get(sort)
+        if not label:
+            print(f"[sort={sort}] неизвестный тип сортировки")
+            return
+
+        try:
+            # <div class="rating-ranking-view" role="button" ...>
+            toggle = None
+            for _ in range(20):  # до ~10 секунд
+                candidates = self.driver.find_elements(
+                    By.CSS_SELECTOR,
+                    "div.rating-ranking-view[role='button']",
+                )
+                visible = [c for c in candidates if c.is_displayed()]
+                if visible:
+                    toggle = visible[0]
+                    break
+                time.sleep(0.5)
+
+            if not toggle:
+                print(f"[sort={sort}] не нашёл кнопку сортировки")
+                return
+            self.driver.execute_script(
+                "arguments[0].scrollIntoView({block: 'center'});", toggle
+            )
+            self.driver.execute_script("arguments[0].click();", toggle)
+            time.sleep(0.7)  # даём попапу появиться
+
+            target = None
+            last_visible_count = 0
+
+            for _ in range(20):  # до ~10 секунд
+                lines = self.driver.find_elements(
+                    By.CSS_SELECTOR,
+                    "div.rating-ranking-view__popup-line",
+                )
+                visible = [ln for ln in lines if ln.is_displayed()]
+                last_visible_count = len(visible)
+
+                for ln in visible:
+                    aria = (ln.get_attribute("aria-label") or "").strip()
+                    text = (ln.text or "").strip()
+                    if aria == label or text == label:
+                        target = ln
+                        break
+
+                if target:
+                    break
+                time.sleep(0.5)
+
+            if not target:
+                print(
+                    f"[sort={sort}] не нашёл пункт '{label}', "
+                    f"видимых строк: {last_visible_count}"
+                )
+                return
+
+            self.driver.execute_script(
+                "arguments[0].scrollIntoView({block: 'center'});", target
+            )
+            self.driver.execute_script("arguments[0].click();", target)
+            time.sleep(1.0)  # даём странице перерисовать отзывы
+
+        except Exception as e:
+            print(f"[sort={sort}] ошибка при применении сортировки: {e}")
+
+    def __get_data_reviews(
+        self,
+        sort: str | None = None,
+        limit: int = -1,
+    ) -> list:
+        """
+        Собирает отзывы.
+
+        sort  — тип сортировки (None / 'default' / 'newest' / 'negative' / 'positive')
+        limit — максимальное количество отзывов:
+                -1  -> все
+                >0  -> не больше указанного количества
+        """
+        #сортировка до сбора
+        self.__set_reviews_sort(sort)
+
+        reviews: list = []
+
+        # скроллим пока не наберём limit или не дойдём до конца
+        self.__scroll_to_bottom(limit=limit)
+
         elements = self.driver.find_elements(By.CLASS_NAME, self.REVIEWS_CLASS)
-        if len(elements) > 1:
-            self.__scroll_to_bottom()
-            elements = self.driver.find_elements(By.CLASS_NAME, self.REVIEWS_CLASS)
-            for elem in elements:
-                reviews.append(self.__get_data_item(elem))
+
+        if limit > 0:
+            elements = elements[:limit]
+
+        for elem in elements:
+            reviews.append(self.__get_data_item(elem))
+
         return reviews
+
+
 
     def __is_valid_page(self) -> bool:
         try:
@@ -259,19 +374,27 @@ class Parser:
         except NoSuchElementException:
             return False
 
-    def parse_all_data(self) -> dict:
+    def parse_all_data(
+        self,
+        sort: str | None = None,
+        limit: int = -1,
+    ) -> dict:
         if not self.__is_valid_page():
             return {"error": "Страница не найдена"}
         return {
             "company_info": self.__get_data_campaign(),
-            "company_reviews": self.__get_data_reviews(),
+            "company_reviews": self.__get_data_reviews(sort=sort, limit=limit),
         }
 
-    def parse_reviews(self) -> dict:
+    def parse_reviews(
+        self,
+        sort: str | None = None,
+        limit: int = -1,
+    ) -> dict:
         if not self.__is_valid_page():
             return {"error": "Страница не найдена"}
-        return {"company_reviews": self.__get_data_reviews()}
-
+        return {"company_reviews": self.__get_data_reviews(sort=sort, limit=limit)}
+    
     def parse_company_info(self) -> dict:
         if not self.__is_valid_page():
             return {"error": "Страница не найдена"}

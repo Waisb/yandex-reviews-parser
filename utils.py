@@ -29,6 +29,7 @@ class YandexParser:
         opts.add_argument("--disable-dev-shm-usage")
         opts.add_argument("headless")
         opts.add_argument("--disable-gpu")
+        opts.add_argument("--window-size=1920,1080")
 
         caps = DesiredCapabilities.CHROME.copy()
         caps["goog:loggingPrefs"] = {"performance": "ALL"}
@@ -68,25 +69,32 @@ class YandexParser:
         finally:
             driver.close()
             driver.quit()
-
-    def parse(self, id_yandex: int, type_parse: str = "default") -> dict:
+    def parse(
+        self,
+        id_yandex: int,
+        type_parse: str = "default",
+        sort: str | None = "newest",
+        limit: int = -1,
+    ) -> dict:
         """
-        :param id_yandex: ID Яндекс компании (businessId / ya_id)
-        :param type_parse:
-            'default' — вся информация (компания + отзывы)
-            'company' — только инфа о компании
-            'reviews' — только отзывы
+        type_parse:
+          - 'default'  — компания + отзывы
+          - 'company'  — только информация о компании
+          - 'reviews'  — только отзывы
+
+        sort  — тип сортировки для отзывов
+        limit — макс. количество отзывов (-1 = все)
         """
         result: dict = {}
         page = self.__open_page(id_yandex)
         time.sleep(4)
         try:
             if type_parse == "default":
-                result = page.parse_all_data()
+                result = page.parse_all_data(sort=sort, limit=limit)
             elif type_parse == "company":
                 result = page.parse_company_info()
             elif type_parse == "reviews":
-                result = page.parse_reviews()
+                result = page.parse_reviews(sort=sort, limit=limit)
         except Exception as e:
             print(e)
             return result
